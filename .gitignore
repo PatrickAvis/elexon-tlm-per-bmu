@@ -221,3 +221,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated reports
+output/
+cache/
+
+# Input data (Elexon data; download yourself - see data/README.md)
+data/*
+!data/README.md
