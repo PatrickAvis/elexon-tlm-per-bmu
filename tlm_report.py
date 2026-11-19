@@ -1,40 +1,41 @@
-"""Build per-BMU Transmission Loss Multiplier (TLM) reports by BSC season.
+"""Build per-BMU Transmission Loss Multiplier (TLM) reports for each Elexon BSC season.
 
-Inputs
-  * data/reg_bm_units.csv   Registered BM Units (Elexon Portal)
-  * data/tlm.csv            Zonal settled TLMs per settlement period (Elexon Portal)
-  * Elexon ETLMO table and Insights API settlement stacks (public, fetched and cached)
+Background
+    BSC Section T: TLM = 1 + TLF(zone, season) + TLMO±(settlement period).
 
-Method
-  BSC Section T: TLM = 1 + TLF(zone, season) + TLMO±(period). The headline "TLM" column is
-  1 + TLF(zone, season), the same definition as the "Winter 2022 TLMs.xlsx" reference.
-  Settled season averages (including TLMO±) from tlm.csv are shown alongside where available.
+    The headline ``TLM`` column produced here is ``1 + TLF(zone, season)``. That is the same
+    definition as the original "Winter 2022 TLMs.xlsx" report this tool replaces. Where the
+    optional ``data/tlm.csv`` covers a season, settled season averages (which include TLMO±)
+    are shown alongside.
 
-  Seasonal zone TLFs are recovered from the Insights API stack TLMs (= 1 + TLF + ETLMO±)
-  minus the published ETLMO values. Where tlm.csv covers the season, its exact zone-to-zone
-  TLF differences are used and the API only sets the common level.
-
-  BMUs are put in zones 1-14 (= GSP Groups _A.._P) by matching their registered TLF to the
-  current zone TLFs, falling back to GSP Group.
+Method (details and evidence in docs/METHOD.md)
+    1. Each BMU is put in a TLM zone (1-14, matching GSP Groups _A.._P). Its registered TLF is
+       matched to the current zone TLFs, falling back to its GSP Group.
+    2. Each zone's seasonal TLF is recovered from Elexon Insights API settlement-stack TLMs
+       (which equal 1 + TLF + ETLMO±) minus Elexon's published ETLMO values, by voting across
+       BMUs.
+    3. Where tlm.csv covers the period, its exact zone-to-zone TLF differences are used, and
+       the API only sets the common level.
 
 Seasons (Elexon BSC seasons; TLFs are set per season)
-  Season YYYY belongs to BSC Year YYYY/YY+1 (1 Apr YYYY - 31 Mar YYYY+1):
-    Spring YYYY = Apr-May YYYY + Mar YYYY+1   (Elexon "Spring A" + "Spring B")
-    Summer YYYY = Jun-Aug YYYY
-    Autumn YYYY = Sep-Nov YYYY
-    Winter YYYY = Dec YYYY - Feb YYYY+1        (e.g. "Winter 2022 TLMs.xlsx")
+    Season YYYY belongs to BSC Year YYYY/YY+1 (1 Apr YYYY - 31 Mar YYYY+1):
+        Spring YYYY = Apr-May YYYY + Mar YYYY+1   (Elexon "Spring A" + "Spring B")
+        Summer YYYY = Jun-Aug YYYY
+        Autumn YYYY = Sep-Nov YYYY
+        Winter YYYY = Dec YYYY - Feb YYYY+1
 
 Usage
-  python tlm_report.py                                   # latest complete BSC winter
-  python tlm_report.py --season "Winter 2022" --compare "data/Winter 2022 TLMs.xlsx"
-  python tlm_report.py --bsc-year 2022 --bsc-year 2023   # all four seasons of each BSC year
-  python tlm_report.py --start 2025-10-01 --end 2026-03-31 --label "Oct25-Mar26"
+    python tlm_report.py                                   # latest complete BSC winter
+    python tlm_report.py --season "Winter 2022" --compare "data/Winter 2022 TLMs.xlsx"
+    python tlm_report.py --bsc-year 2022 --bsc-year 2023   # all four seasons of each BSC Year
+    python tlm_report.py --start 2025-10-01 --end 2026-03-31 --label "Oct25-Mar26"
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 
@@ -42,14 +43,19 @@ import pandas as pd
 
 import elexon_api as api
 
+# --------------------------------------------------------------------------- configuration
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_TLM = ROOT / "data" / "tlm.csv"
 DEFAULT_REG = ROOT / "data" / "reg_bm_units.csv"
 DEFAULT_OUT_DIR = ROOT / "output"
 DEFAULT_CACHE = ROOT / "cache"
-DEFAULT_SPS = [2, 10, 18, 26, 34, 42]  # every 4 hours
 
-# GSP Group Id -> (TLM zone number, GSP Group Name)
+# Settlement periods sampled per day from the API (every 4 hours). More periods give more
+# evidence per zone at the cost of more API calls (2 calls per period: bid and offer stacks).
+DEFAULT_SPS = [2, 10, 18, 26, 34, 42]
+
+# GSP Group Id -> (TLM zone number, GSP Group name). TLM zones 1-14 follow GSP Group order.
 GSP_ZONE: dict[str, tuple[int, str]] = {
     "_A": (1, "Eastern"),
     "_B": (2, "East Midlands"),
@@ -67,59 +73,87 @@ GSP_ZONE: dict[str, tuple[int, str]] = {
     "_P": (14, "North Scotland"),
 }
 ZONE_GSP = {zone: gsp for gsp, (zone, _) in GSP_ZONE.items()}
+ZONES = range(1, 15)
 
-# Elexon BSC seasons. Season YYYY belongs to BSC Year YYYY/YY+1 and may have several parts:
-# (year offset, start month, number of months). Spring is split by the BSC Year boundary.
+# Elexon BSC seasons. Season YYYY belongs to BSC Year YYYY/YY+1 and may have several parts,
+# each given as (year offset, start month, number of months). Spring is split by the BSC Year
+# boundary into Apr-May and the following March, which share the same TLFs.
 BSC_SEASONS: dict[str, list[tuple[int, int, int]]] = {
     "spring": [(0, 4, 2), (1, 3, 1)],   # Apr-May YYYY + Mar YYYY+1
     "summer": [(0, 6, 3)],              # Jun-Aug YYYY
     "autumn": [(0, 9, 3)],              # Sep-Nov YYYY
     "winter": [(0, 12, 3)],             # Dec YYYY - Feb YYYY+1
 }
-Segments = list[tuple[date, date]]
 
-TLF_DP = 7
+Segments = list[tuple[date, date]]
+"""Inclusive (start, end) date ranges that together make up one report period."""
+
+TLF_DP = 7      # TLFs/TLMs are published to 7 decimal places
+VOTE_DP = 6     # candidate values are grouped at 6 d.p. when voting (absorbs float noise)
+TLF_CHANGE_TOL = 1e-6   # zone value differences below this are treated as "no change"
+
+# Confidence labels, weakest first. A season's confidence is the weakest of its bands.
 CONF_ORDER = ["None", "Low", "Medium (decided by P/C status)", "Medium", "High"]
-VOTE_DP = 6
+
+TLM_COLUMNS = ["Settlement Date", "Settlement Run Type", "Settlement Period", "Zone",
+               "Off Taking", "Delivering"]
 
 
 # --------------------------------------------------------------------------- seasons
 
 
 def season_segments(name: str) -> Segments:
-    """'Winter 2022' -> [(2022-12-01, 2023-02-28)]; 'Spring 2025' -> Apr-May 2025 + Mar 2026."""
+    """Return the date segments of a BSC season.
+
+    Examples:
+        "Winter 2022" -> [(2022-12-01, 2023-02-28)]
+        "Spring 2025" -> [(2025-04-01, 2025-05-31), (2026-03-01, 2026-03-31)]
+
+    Raises:
+        ValueError: if ``name`` isn't "<Spring|Summer|Autumn|Winter> <year>".
+    """
     try:
-        kind, year = name.split()
+        kind, year_text = name.split()
         parts = BSC_SEASONS[kind.lower()]
-        year = int(year)
+        year = int(year_text)
     except (ValueError, KeyError):
-        raise ValueError(f"Bad season {name!r}; use e.g. 'Winter 2022' (Spring/Summer/Autumn/Winter)")
-    segs = []
+        raise ValueError(f"Bad season {name!r}; use e.g. 'Winter 2022' "
+                         "(Spring/Summer/Autumn/Winter)") from None
+    segments = []
     for offset, month, months in parts:
         start = date(year + offset, month, 1)
         end = (pd.Timestamp(start) + pd.DateOffset(months=months) - pd.Timedelta(days=1)).date()
-        segs.append((start, end))
-    return segs
+        segments.append((start, end))
+    return segments
 
 
 def bsc_year_seasons(year: int) -> list[str]:
-    return [f"{k.title()} {year}" for k in BSC_SEASONS]
+    """Names of the four seasons of BSC Year ``year``/``year+1``, e.g. ["Spring 2025", ...]."""
+    return [f"{kind.title()} {year}" for kind in BSC_SEASONS]
 
 
-def describe(segs: Segments) -> str:
-    return " + ".join(f"{a} to {b}" for a, b in segs)
+def describe(segments: Segments) -> str:
+    """Human-readable form of date segments, e.g. "2025-04-01 to 2025-05-31 + ..."."""
+    return " + ".join(f"{start} to {end}" for start, end in segments)
 
 
-def latest_complete_winter(max_date: date) -> str:
-    y = max_date.year if max_date.month >= 3 else max_date.year - 1  # winter ends end-Feb of y
-    return f"Winter {y - 1}"
+def latest_complete_winter(as_of: date) -> str:
+    """Name of the most recent BSC Winter (Dec-Feb) that has ended by ``as_of``."""
+    # Winter Y runs Dec Y - Feb Y+1, so from March of year Y+1 onwards Winter Y is complete.
+    end_year = as_of.year if as_of.month >= 3 else as_of.year - 1
+    return f"Winter {end_year - 1}"
 
 
 # --------------------------------------------------------------------------- loading
 
 
 def load_registration(path: Path) -> pd.DataFrame:
-    """Read the Elexon registered BM Units CSV (2 title lines precede the header)."""
+    """Read the Elexon Portal "Registered BM Units" CSV.
+
+    The file starts with a title line and a blank line before the header row. Text columns
+    used later are stripped, with empty strings turned into missing values, and ``TLF`` is
+    made numeric.
+    """
     reg = pd.read_csv(path, skiprows=2, dtype={"BM Unit ID": str})
     reg.columns = [c.strip() for c in reg.columns]
     reg = reg.dropna(subset=["BM Unit ID"])
@@ -130,13 +164,12 @@ def load_registration(path: Path) -> pd.DataFrame:
     return reg
 
 
-TLM_COLUMNS = ["Settlement Date", "Settlement Run Type", "Settlement Period", "Zone",
-               "Off Taking", "Delivering"]
-
-
 def load_tlm(path: Path) -> pd.DataFrame:
-    """Zonal settled TLMs. Optional: without the file, zone TLFs come from the API alone
-    and the settled-average columns are left blank."""
+    """Read the optional Elexon zonal settled TLM CSV (one row per date, period and zone).
+
+    If the file doesn't exist, an empty frame with the expected columns is returned. Zone
+    TLFs then come from the API alone, and the settled-average columns are left blank.
+    """
     if not path.exists():
         print(f"Note: {path} not found - API-only zone TLFs, no settled averages.")
         return pd.DataFrame(columns=TLM_COLUMNS)
@@ -150,12 +183,20 @@ def load_tlm(path: Path) -> pd.DataFrame:
 
 
 def zone_tlf_table(reg: pd.DataFrame) -> pd.DataFrame:
-    """Current zone TLF = modal TLF of supplier (S) BMUs in each GSP Group."""
-    supp = reg[(reg["BMU Type"] == "S") & reg["GSP Group Id"].isin(GSP_ZONE.keys())]
-    tlf = supp.groupby("GSP Group Id")["TLF"].agg(lambda s: s.mode().iloc[0])
+    """Current TLF of each zone: the most common TLF among supplier (S) BMUs in its GSP Group.
+
+    Returns:
+        One row per zone: Zone, GSP Group Id, GSP Group Name, Current Zone TLF.
+
+    Raises:
+        ValueError: if a GSP Group has no supplier BMUs, or two zones share a TLF. Zones are
+            identified by TLF, so the values must be distinct.
+    """
+    suppliers = reg[(reg["BMU Type"] == "S") & reg["GSP Group Id"].isin(GSP_ZONE.keys())]
+    tlf = suppliers.groupby("GSP Group Id")["TLF"].agg(lambda s: s.mode().iloc[0])
     table = pd.DataFrame([
-        {"Zone": z, "GSP Group Id": g, "GSP Group Name": name, "Current Zone TLF": tlf.get(g)}
-        for g, (z, name) in GSP_ZONE.items()
+        {"Zone": zone, "GSP Group Id": gsp, "GSP Group Name": name, "Current Zone TLF": tlf.get(gsp)}
+        for gsp, (zone, name) in GSP_ZONE.items()
     ])
     if table["Current Zone TLF"].isna().any():
         missing = list(table.loc[table["Current Zone TLF"].isna(), "GSP Group Id"])
@@ -166,7 +207,15 @@ def zone_tlf_table(reg: pd.DataFrame) -> pd.DataFrame:
 
 
 def assign_zones(reg: pd.DataFrame, zones: pd.DataFrame) -> pd.DataFrame:
-    """Add Zone, Zone Source and _notes columns to the registration frame."""
+    """Add each BMU's TLM zone to the registration frame.
+
+    The BMU's registered TLF is matched to the current zone TLFs. This covers transmission
+    (T_) and interconnector (I_) units, which have no GSP Group. Where the TLF doesn't match,
+    the GSP Group is used.
+
+    Adds the columns ``Zone`` (nullable int), ``Zone Source`` ("TLF", "GSP Group" or
+    "Unmapped") and ``_notes`` (a list of strings per BMU, used for the report's Notes column).
+    """
     tlf_to_zone = dict(zip(zones["Current Zone TLF"].round(TLF_DP), zones["Zone"]))
     out = reg.copy()
     by_tlf = out["TLF"].round(TLF_DP).map(tlf_to_zone)
@@ -181,7 +230,8 @@ def assign_zones(reg: pd.DataFrame, zones: pd.DataFrame) -> pd.DataFrame:
     for t, g in zip(by_tlf, by_gsp):
         n = []
         if pd.notna(t) and pd.notna(g) and t != g:
-            n.append(f"TLF matches zone {int(t)} ({ZONE_GSP[int(t)]}) but GSP Group is zone {int(g)}; used TLF")
+            n.append(f"TLF matches zone {int(t)} ({ZONE_GSP[int(t)]}) but GSP Group is zone "
+                     f"{int(g)}; used TLF")
         if pd.isna(t) and pd.notna(g):
             n.append("TLF does not match a zone TLF; zone from GSP Group")
         if pd.isna(t) and pd.isna(g):
@@ -195,153 +245,221 @@ def assign_zones(reg: pd.DataFrame, zones: pd.DataFrame) -> pd.DataFrame:
 
 
 def _candidates(obs: pd.DataFrame, e_plus: float, e_minus: float) -> pd.DataFrame:
-    """Each stack TLM gives two candidates for 1 + TLF: minus ETLMO+ (P) or ETLMO- (C)."""
-    p = obs.assign(Value=obs["Stack TLM"] - e_plus, Tag="P")
-    c = obs.assign(Value=obs["Stack TLM"] - e_minus, Tag="C")
-    return pd.concat([p, c], ignore_index=True)
+    """Turn each stack TLM into its two candidate values for 1 + TLF.
+
+    It's not known whether the BMU was delivering or offtaking, so both are kept:
+    ``TLM - ETLMO+`` (tag "P", delivering) and ``TLM - ETLMO-`` (tag "C", offtaking).
+    """
+    delivering = obs.assign(Value=obs["Stack TLM"] - e_plus, Tag="P")
+    offtaking = obs.assign(Value=obs["Stack TLM"] - e_minus, Tag="C")
+    return pd.concat([delivering, offtaking], ignore_index=True)
 
 
 def _pick(cands: pd.DataFrame) -> tuple[float, int, str]:
-    """Vote on Key by distinct BMUs; tie-break by BMUs whose P/C status matches the tag.
+    """Choose the winning candidate ``Key`` by voting.
 
-    Returns (key, support, confidence).
+    Votes are counted as distinct BMUs supporting each key. Ties go to the key backed by more
+    BMUs whose registered P/C status matches the candidate's tag. Any remaining tie is broken
+    by the smallest key, so results are deterministic, and is labelled "Low".
+
+    Args:
+        cands: candidate rows with columns ``Key``, ``BM Unit ID``, ``Tag`` and ``Status``.
+
+    Returns:
+        (winning key, number of distinct BMUs supporting it, confidence label)
     """
     cands = cands.assign(StatusMatch=cands["Status"] == cands["Tag"])
-    votes = cands.groupby("Key").agg(
-        Support=("BM Unit ID", "nunique"),
-        StatusSupport=("BM Unit ID", lambda s: s[cands.loc[s.index, "StatusMatch"]].nunique()),
-    ).sort_values(["Support", "StatusSupport"], ascending=False)
+    votes = (cands.groupby("Key")
+             .agg(Support=("BM Unit ID", "nunique"),
+                  StatusSupport=("BM Unit ID",
+                                 lambda s: s[cands.loc[s.index, "StatusMatch"]].nunique()))
+             .reset_index()
+             .sort_values(["Support", "StatusSupport", "Key"], ascending=[False, False, True]))
     top = votes.iloc[0]
     second = votes.iloc[1] if len(votes) > 1 else None
     if second is None or top.Support > second.Support:
-        conf = "High" if top.Support >= 2 else "Medium"
+        confidence = "High" if top.Support >= 2 else "Medium"
     elif top.StatusSupport > second.StatusSupport:
-        conf = "Medium (decided by P/C status)"
+        confidence = "Medium (decided by P/C status)"
     else:
-        conf = "Low"
-    return votes.index[0], int(top.Support), conf
+        confidence = "Low"
+    return top.Key, int(top.Support), confidence
 
 
-def band_zone_tlf(obs: pd.DataFrame, e_plus: float, e_minus: float, bmu_zone: dict,
-                  bmu_status: dict, rel: pd.Series | None = None) -> pd.DataFrame:
-    """1 + TLF per zone for one ETLMO band.
+def band_zone_tlf(obs: pd.DataFrame, e_plus: float, e_minus: float, bmu_zone: dict[str, int],
+                  bmu_status: dict[str, str], rel: pd.Series | None = None) -> pd.DataFrame:
+    """Recover 1 + TLF for every zone within one ETLMO band (a period of constant ETLMO).
 
-    obs: distinct (BM Unit ID, Stack TLM). rel: optional exact TLF(z) - TLF(1) from tlm.csv.
+    Args:
+        obs: distinct (``BM Unit ID``, ``Stack TLM``) pairs from the API for the band.
+        e_plus, e_minus: the band's ETLMO+ and ETLMO-.
+        bmu_zone: BMU ID -> zone. BMUs without a zone are ignored.
+        bmu_status: BMU ID -> registered P/C status, used to break ties.
+        rel: optional exact TLF(z) - TLF(1) per zone from tlm.csv. If given, a single vote
+            across all zones sets the common level. Otherwise each zone is voted separately.
+
+    Returns:
+        One row per zone: Zone, 1 + TLF (NaN if no data), Method, API BMUs, Confidence.
     """
     obs = obs[obs["BM Unit ID"].isin(bmu_zone.keys())].copy()
     obs["Zone"] = obs["BM Unit ID"].map(bmu_zone).astype(int)
     obs["Status"] = obs["BM Unit ID"].map(bmu_status)
     cands = _candidates(obs, e_plus, e_minus)
-    zones = range(1, 15)
 
     if rel is not None and not cands.empty:
-        # common level: 1 + TLF(zone 1), voted across all zones at once
-        cands["Key"] = (cands["Value"] - cands["Zone"].map(rel)).round(VOTE_DP)
-        key, support, conf = _pick(cands)
-        level = (cands.loc[cands["Key"] == key, "Value"] - cands.loc[cands["Key"] == key, "Zone"].map(rel)).median()
-        per_zone = cands[cands["Key"] == key].groupby("Zone")["BM Unit ID"].nunique()
+        # Anchored: every candidate implies a value for 1 + TLF(zone 1); vote on that level.
+        cands["Level"] = cands["Value"] - cands["Zone"].map(rel)
+        cands["Key"] = cands["Level"].round(VOTE_DP)
+        key, support, confidence = _pick(cands)
+        winners = cands[cands["Key"] == key]
+        level = winners["Level"].median()
+        per_zone = winners.groupby("Zone")["BM Unit ID"].nunique()
         return pd.DataFrame({
-            "Zone": list(zones),
-            "1 + TLF": [round(level + rel[z], TLF_DP) for z in zones],
+            "Zone": list(ZONES),
+            "1 + TLF": [round(level + rel[z], TLF_DP) for z in ZONES],
             "Method": "tlm.csv zone differences + API level",
-            "API BMUs": [int(per_zone.get(z, 0)) for z in zones],
-            "Confidence": conf if support >= 3 else "Low",
+            "API BMUs": [int(per_zone.get(z, 0)) for z in ZONES],
+            "Confidence": confidence if support >= 3 else "Low",
         })
 
+    # API only: vote separately in each zone.
     rows = []
-    for z in zones:
+    for z in ZONES:
         zc = cands[cands["Zone"] == z].copy()
         if zc.empty:
             rows.append({"Zone": z, "1 + TLF": float("nan"), "Method": "API", "API BMUs": 0,
                          "Confidence": "None"})
             continue
         zc["Key"] = zc["Value"].round(VOTE_DP)
-        key, support, conf = _pick(zc)
+        key, support, confidence = _pick(zc)
         value = zc.loc[zc["Key"] == key, "Value"].median()
         rows.append({"Zone": z, "1 + TLF": round(value, TLF_DP), "Method": "API",
-                     "API BMUs": support, "Confidence": conf})
+                     "API BMUs": support, "Confidence": confidence})
     return pd.DataFrame(rows)
 
 
 def tlm_relative(tlm: pd.DataFrame, start: date, end: date) -> pd.Series | None:
-    """Exact TLF(z) - TLF(1) from tlm.csv Off Taking, if it fully covers [start, end]."""
+    """Exact zone TLF differences, TLF(z) - TLF(1), from tlm.csv for [start, end].
+
+    Within any settlement period, every zone gets the same TLMO, so OffTaking(z) -
+    OffTaking(1) = TLF(z) - TLF(1).
+
+    Returns:
+        A Series indexed by zone, or None if tlm.csv doesn't cover every day of the range or
+        the differences change within it.
+    """
     sel = tlm[(tlm["Settlement Date"] >= start) & (tlm["Settlement Date"] <= end)]
     if sel["Settlement Date"].nunique() != (end - start).days + 1:
         return None
     piv = sel.pivot_table(index=["Settlement Date", "Settlement Period"], columns="Zone",
                           values="Off Taking")
     rel = piv.sub(piv[1], axis=0)
-    if float((rel.max() - rel.min()).max()) > 1e-6:  # TLFs changed inside band
+    if float((rel.max() - rel.min()).max()) > TLF_CHANGE_TOL:
         return None
     return rel.mean().round(TLF_DP)
 
 
-def season_zone_tlf(segs: Segments, tlm: pd.DataFrame, reg: pd.DataFrame,
-                    etlmo: pd.DataFrame, sps: list[int], cache: Path) -> tuple[pd.DataFrame, list[str]]:
-    """Season (days-weighted over ETLMO bands) 1 + TLF per zone, plus log lines."""
+def season_zone_tlf(segments: Segments, tlm: pd.DataFrame, reg: pd.DataFrame,
+                    etlmo: pd.DataFrame, sps: list[int], cache: Path,
+                    ) -> tuple[pd.DataFrame, list[str]]:
+    """Recover each zone's 1 + TLF for a report period, which may span several ETLMO bands.
+
+    Each band is solved with :func:`band_zone_tlf`. The bands are then combined as a
+    day-weighted average per zone. Bands with no data for a zone (e.g. stacks holding only
+    1.0 placeholders) are left out of that zone's average and flagged, rather than diluting it.
+
+    Args:
+        segments: date ranges making up the period.
+        tlm: zonal settled TLMs (may be empty).
+        reg: registration frame after :func:`assign_zones`.
+        etlmo: ETLMO table from :func:`elexon_api.load_etlmo`.
+        sps: settlement periods to sample per day.
+        cache: download cache directory.
+
+    Returns:
+        (one row per zone: Zone, Days, Days With Data, API BMUs, Method, Confidence, 1 + TLF,
+        Season Zone TLF; log lines describing each band and any warnings)
+    """
     bmu_zone = {b: int(z) for b, z in zip(reg["BM Unit ID"], reg["Zone"]) if pd.notna(z)}
-    bmu_status = dict(zip(reg["BM Unit ID"], reg["Prod/Cons Status"].fillna(reg["Prod/Cons Flag"])))
+    bmu_status = dict(zip(reg["BM Unit ID"],
+                          reg["Prod/Cons Status"].fillna(reg["Prod/Cons Flag"])))
     parts, log = [], []
-    for band in [b for start, end in segs for b in api.etlmo_bands(etlmo, start, end)]:
+    bands = [b for start, end in segments for b in api.etlmo_bands(etlmo, start, end)]
+    for band in bands:
         obs = api.stack_tlms(band["From"], band["To"], sps, cache)
         rel = tlm_relative(tlm, band["From"], band["To"])
         res = band_zone_tlf(obs, band["ETLMO+"], band["ETLMO-"], bmu_zone, bmu_status, rel)
         res["Days"] = (band["To"] - band["From"]).days + 1
         parts.append(res)
         weak = res.loc[res["Confidence"].isin(["Low", "None"]), "Zone"].tolist()
-        log.append(f"{band['From']}..{band['To']}: ETLMO+ {band['ETLMO+']}, ETLMO- {band['ETLMO-']}; "
-                   f"{len(obs)} API (BMU, TLM) pairs; method: {res['Method'].iloc[0]}; "
-                   f"low-confidence zones: {weak or 'none'}")
+        log.append(f"{band['From']}..{band['To']}: ETLMO+ {band['ETLMO+']}, "
+                   f"ETLMO- {band['ETLMO-']}; {len(obs)} API (BMU, TLM) pairs; "
+                   f"method: {res['Method'].iloc[0]}; low-confidence zones: {weak or 'none'}")
     allp = pd.concat(parts)
-    # TLFs should be constant within a BSC season; flag zones where the parts disagree
-    # (e.g. Spring 2025: Elexon's mid-April 2025 TLF correction).
-    spread = allp.groupby("Zone")["1 + TLF"].agg(lambda s: s.max() - s.min() if s.notna().any() else 0.0)
-    changed = spread[spread > 1e-6]
+
+    # TLFs should be constant within a BSC season; flag zones where the bands disagree
+    # (e.g. Spring 2025, after Elexon's mid-April 2025 TLF correction).
+    spread = allp.groupby("Zone")["1 + TLF"].agg(
+        lambda s: s.max() - s.min() if s.notna().any() else 0.0)
+    changed = spread[spread > TLF_CHANGE_TOL]
     if not changed.empty:
-        log.append("WARNING: zone TLFs change within this season, so the value is a day-weighted blend "
-                   f"(max change {changed.max():.5f}; zones {list(changed.index)})")
-    # Bands with no usable API data for a zone (e.g. stacks holding only 1.0 placeholders)
-    # are left out of that zone's day-weighted average rather than diluting it.
-    has = allp["1 + TLF"].notna()
-    allp["w"] = allp["1 + TLF"].where(has, 0) * allp["Days"]
-    allp["DaysWithData"] = allp["Days"].where(has, 0)
-    out = allp.groupby("Zone").agg(w=("w", "sum"), Days=("Days", "sum"),
-                                   **{"Days With Data": ("DaysWithData", "sum"),
-                                      "API BMUs": ("API BMUs", "sum")},
-                                   Method=("Method", "first"),
-                                   Confidence=("Confidence",
-                                               lambda s: min((c for c in s if c != "None"),
-                                                             key=CONF_ORDER.index, default="None")))
-    out["1 + TLF"] = (out["w"] / out["Days With Data"].where(out["Days With Data"] > 0)).round(TLF_DP)
+        log.append("WARNING: zone TLFs change within this season, so the value is a day-weighted "
+                   f"blend (max change {changed.max():.5f}; zones {list(changed.index)})")
+
+    has_data = allp["1 + TLF"].notna()
+    allp["Weighted"] = allp["1 + TLF"].where(has_data, 0) * allp["Days"]
+    allp["DaysWithData"] = allp["Days"].where(has_data, 0)
+    out = allp.groupby("Zone").agg(
+        Weighted=("Weighted", "sum"),
+        Days=("Days", "sum"),
+        **{"Days With Data": ("DaysWithData", "sum"), "API BMUs": ("API BMUs", "sum")},
+        Method=("Method", "first"),
+        # weakest label among bands that had data
+        Confidence=("Confidence", lambda s: min((c for c in s if c != "None"),
+                                                key=CONF_ORDER.index, default="None")),
+    )
+    out["1 + TLF"] = (out["Weighted"] / out["Days With Data"].where(out["Days With Data"] > 0)
+                      ).round(TLF_DP)
     out["Season Zone TLF"] = (out["1 + TLF"] - 1).round(TLF_DP)
+
     partial = (out["Days With Data"] > 0) & (out["Days With Data"] < out["Days"])
     out.loc[partial, "Confidence"] = out.loc[partial].apply(
-        lambda r: f"{r['Confidence']}; data for {int(r['Days With Data'])} of {int(r['Days'])} days", axis=1)
+        lambda r: f"{r['Confidence']}; data for {int(r['Days With Data'])} of "
+                  f"{int(r['Days'])} days", axis=1)
     if partial.any():
         log.append("Zones averaged over part of the range (no API data in some bands): "
                    + ", ".join(f"zone {z} ({int(d)}/{int(t)} days)" for z, d, t in
                                zip(out.index[partial], out.loc[partial, "Days With Data"],
                                    out.loc[partial, "Days"])))
     out.loc[out.index.isin(changed.index), "Confidence"] += "; TLF changed within season (blend)"
-    return out.drop(columns=["w"]).reset_index(), log
+    return out.drop(columns=["Weighted"]).reset_index(), log
 
 
 # --------------------------------------------------------------------------- settled TLMs
 
 
-def zone_averages(tlm: pd.DataFrame, segs: Segments) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Average settled zonal TLMs over the date segments. Returns (zone stats, run-type coverage)."""
+def zone_averages(tlm: pd.DataFrame, segments: Segments) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Average the settled zonal TLMs from tlm.csv over the date segments.
+
+    Returns:
+        (one row per zone with average/min/max Delivering and Off Taking TLMs, the number of
+        settlement periods, and the number of periods where Delivering == Off Taking;
+        the settlement run types covering the range)
+
+    Raises:
+        ValueError: if tlm.csv is empty or doesn't cover the whole range.
+    """
     if tlm.empty:
         raise ValueError("no tlm.csv data")
     lo, hi = tlm["Settlement Date"].min(), tlm["Settlement Date"].max()
-    for start, end in segs:
+    for start, end in segments:
         if start > end:
             raise ValueError("start must be on or before end")
         if start < lo or end > hi:
             raise ValueError(f"Requested {start}..{end} is outside TLM file coverage {lo}..{hi}")
 
     mask = pd.Series(False, index=tlm.index)
-    for start, end in segs:
+    for start, end in segments:
         mask |= (tlm["Settlement Date"] >= start) & (tlm["Settlement Date"] <= end)
     sel = tlm[mask].copy()
     sel["Anomalous"] = (sel["Off Taking"] - sel["Delivering"]).abs() < 1e-9
@@ -361,27 +479,30 @@ def zone_averages(tlm: pd.DataFrame, segs: Segments) -> tuple[pd.DataFrame, pd.D
             .rename(columns={"min": "From", "max": "To", "nunique": "Days"})
             .sort_values("From").reset_index())
 
-    missing = sum((b - a).days + 1 for a, b in segs) - sel["Settlement Date"].nunique()
+    missing = sum((end - start).days + 1 for start, end in segments) - sel["Settlement Date"].nunique()
     if missing:
-        print(f"WARNING: {missing} day(s) in range missing from TLM file")
+        print(f"  WARNING: {missing} day(s) in range missing from TLM file")
     return stats, runs
 
 
 def check_consistency(zone_stats: pd.DataFrame) -> str:
-    """Off Taking - Delivering (= TLMO- - TLMO+) should be the same for every zone.
+    """Check that Off Taking - Delivering (= TLMO- - TLMO+) is the same in every zone.
 
-    The published file has periods where a zone's Delivering equals its Off Taking
-    (seen in RF runs, Jul 2024 - Jan 2025), which breaks this. Those are reported.
+    Elexon's TLM file has periods where a zone's Delivering equals its Off Taking (RF runs,
+    Jul 2024 - Jan 2025), which breaks this. Those periods are counted and reported.
+
+    Returns:
+        A one-line summary, which is also printed.
     """
     spread = zone_stats["Avg Off Taking TLM"] - zone_stats["Avg Delivering TLM"]
-    rng = spread.max() - spread.min()
     n_bad = int(zone_stats["Periods Delivering = Off Taking"].sum())
-    msg = (f"avg(Off Taking - Delivering) = {spread.median():.7f}; range across zones {rng:.2e}; "
-           f"{n_bad} zone-periods with Delivering = Off Taking")
+    msg = (f"avg(Off Taking - Delivering) = {spread.median():.7f}; range across zones "
+           f"{spread.max() - spread.min():.2e}; {n_bad} zone-periods with Delivering = Off Taking")
     if n_bad:
         affected = zone_stats[zone_stats["Periods Delivering = Off Taking"] > 0]
         msg += " (" + ", ".join(f"zone {int(z)}: {int(n)}" for z, n in
-                                zip(affected["Zone"], affected["Periods Delivering = Off Taking"])) + ")"
+                                zip(affected["Zone"],
+                                    affected["Periods Delivering = Off Taking"])) + ")"
         print(f"  WARNING: {msg}")
     else:
         print(f"  Settled TLM check OK: {msg}")
@@ -393,12 +514,20 @@ def check_consistency(zone_stats: pd.DataFrame) -> str:
 
 def build_report(reg: pd.DataFrame, season_tlf: pd.DataFrame, zones: pd.DataFrame,
                  zone_stats: pd.DataFrame | None) -> pd.DataFrame:
+    """Build the per-BMU "TLMs" sheet.
+
+    ``TLM`` is the BMU's zone 1 + TLF for the season. ``Avg Settled TLM`` uses the zone's
+    settled Delivering average for production (P) BMUs and Off Taking for consumption (C) BMUs.
+    A blank P/C status falls back to the P/C flag, then to C.
+    """
     df = (reg.merge(season_tlf[["Zone", "1 + TLF", "Season Zone TLF", "Confidence"]]
-                    .rename(columns={"Confidence": "Season TLF Confidence"}), on="Zone", how="left")
+                    .rename(columns={"Confidence": "Season TLF Confidence"}),
+                    on="Zone", how="left")
              .merge(zones[["Zone", "GSP Group Name"]].rename(columns={"GSP Group Name": "Zone Name"}),
                     on="Zone", how="left"))
     if zone_stats is not None:
-        df = df.merge(zone_stats[["Zone", "Avg Delivering TLM", "Avg Off Taking TLM"]], on="Zone", how="left")
+        df = df.merge(zone_stats[["Zone", "Avg Delivering TLM", "Avg Off Taking TLM"]],
+                      on="Zone", how="left")
     else:
         df["Avg Delivering TLM"] = float("nan")
         df["Avg Off Taking TLM"] = float("nan")
@@ -411,6 +540,7 @@ def build_report(reg: pd.DataFrame, season_tlf: pd.DataFrame, zones: pd.DataFram
         elif pd.isna(s):
             n.append("Prod/Cons Status and Flag blank; assumed C (Off Taking)")
     status = status.fillna("C")
+
     has_settled = df["Avg Delivering TLM"].notna()
     df["Settled Basis"] = status.map({"P": "Delivering", "C": "Off Taking"}).where(has_settled)
     df["Avg Settled TLM"] = df["Avg Delivering TLM"].where(status == "P", df["Avg Off Taking TLM"])
@@ -418,16 +548,28 @@ def build_report(reg: pd.DataFrame, season_tlf: pd.DataFrame, zones: pd.DataFram
     df["Notes"] = ["; ".join(n) for n in notes]
     df = df.rename(columns={"TLF": "Registered TLF (current)"})
 
-    cols = ["BM Unit ID", "TLM", "BMU Name", "Party Name", "BMU Type", "GSP Group Id",
-            "GSP Group Name", "Zone", "Zone Name", "Zone Source", "Prod/Cons Status",
-            "Registered TLF (current)", "Season Zone TLF", "Season TLF Confidence", "Avg Settled TLM", "Settled Basis",
-            "Avg Delivering TLM", "Avg Off Taking TLM", "Notes"]
-    return df[cols].sort_values("BM Unit ID").reset_index(drop=True)
+    columns = ["BM Unit ID", "TLM", "BMU Name", "Party Name", "BMU Type", "GSP Group Id",
+               "GSP Group Name", "Zone", "Zone Name", "Zone Source", "Prod/Cons Status",
+               "Registered TLF (current)", "Season Zone TLF", "Season TLF Confidence",
+               "Avg Settled TLM", "Settled Basis", "Avg Delivering TLM", "Avg Off Taking TLM",
+               "Notes"]
+    return df[columns].sort_values("BM Unit ID").reset_index(drop=True)
 
 
-def compare_reference(report: pd.DataFrame, ref_path: Path, tol: float = 5e-7) -> tuple[pd.DataFrame, dict]:
+def compare_reference(report: pd.DataFrame, ref_path: Path,
+                      tol: float = 5e-7) -> tuple[pd.DataFrame, dict]:
+    """Compare the report's TLMs BMU by BMU with a reference workbook (``BM Unit ID``, ``TLM``).
+
+    Args:
+        tol: absolute difference still counted as a match. The default allows for API values
+            given to 6 d.p.
+
+    Returns:
+        (one row per BMU in either file with a Status column; counts per Status)
+    """
     ref = pd.read_excel(ref_path)[["BM Unit ID", "TLM"]].rename(columns={"TLM": "Reference TLM"})
-    new = report[["BM Unit ID", "TLM", "BMU Type", "Zone", "Zone Source"]].rename(columns={"TLM": "New TLM"})
+    new = (report[["BM Unit ID", "TLM", "BMU Type", "Zone", "Zone Source"]]
+           .rename(columns={"TLM": "New TLM"}))
     m = ref.merge(new, on="BM Unit ID", how="outer", indicator=True)
     m["Difference"] = (m["New TLM"] - m["Reference TLM"]).round(TLF_DP)
     status = pd.Series("Different", index=m.index)
@@ -437,14 +579,19 @@ def compare_reference(report: pd.DataFrame, ref_path: Path, tol: float = 5e-7) -
     status[m["_merge"] == "right_only"] = "Only in new (registered since)"
     m["Status"] = status
     m = m.drop(columns="_merge").sort_values(["Status", "BM Unit ID"]).reset_index(drop=True)
-    summary = m["Status"].value_counts().to_dict()
-    return m, summary
+    return m, m["Status"].value_counts().to_dict()
 
 
 def write_excel(path: Path, sheets: dict[str, pd.DataFrame], info: list[tuple[str, object]],
-                runs: pd.DataFrame | None) -> None:
+                runs: pd.DataFrame | None = None) -> None:
+    """Write a workbook: the given data sheets, then an "Info" sheet.
+
+    Data sheets get a frozen header, an autofilter and sized columns. TLM/TLF columns are
+    shown to 7 d.p. If ``runs`` is given, it's appended below the Info items.
+    """
     from openpyxl.utils import get_column_letter
 
+    season_prefixes = tuple(k.title() for k in BSC_SEASONS)
     path.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(path, engine="openpyxl") as xw:
         for name, df in sheets.items():
@@ -456,7 +603,8 @@ def write_excel(path: Path, sheets: dict[str, pd.DataFrame], info: list[tuple[st
                 letter = get_column_letter(idx)
                 width = max(len(str(col)), *(len(str(v)) for v in df[col].head(500))) + 2
                 ws.column_dimensions[letter].width = min(width, 60)
-                if any(k in str(col) for k in ("TLM", "TLF", "Difference")) or str(col).startswith(("Winter", "Spring", "Summer", "Autumn")):
+                label = str(col)
+                if any(k in label for k in ("TLM", "TLF", "Difference")) or label.startswith(season_prefixes):
                     for cell in ws[letter][1:]:
                         cell.number_format = "0.0000000"
         pd.DataFrame(info, columns=["Item", "Value"]).to_excel(xw, sheet_name="Info", index=False)
@@ -468,158 +616,224 @@ def write_excel(path: Path, sheets: dict[str, pd.DataFrame], info: list[tuple[st
             ws.cell(row=len(info) + 3, column=1, value="Settlement runs in tlm.csv for this range")
 
 
-def compares(label: str, args) -> bool:
-    """Compare only the season named in the reference file (e.g. 'Winter 2022 TLMs.xlsx'),
-    or every range if the file name names none of them."""
-    name = args.compare.name.lower()
-    labels = [r[0].lower() for r in args.ranges]
-    return label.lower() in name or not any(l in name for l in labels)
+# --------------------------------------------------------------------------- orchestration
 
 
-def run_range(label: str, segs: Segments, tlm: pd.DataFrame, reg: pd.DataFrame,
-              zones: pd.DataFrame, etlmo: pd.DataFrame, args) -> tuple[pd.DataFrame, pd.DataFrame]:
-    print(f"\n{label}: {describe(segs)}")
-    if segs[-1][1] >= date.today():
-        raise ValueError(f"season not finished until {segs[-1][1]}")
-    season_tlf, log = season_zone_tlf(segs, tlm, reg, etlmo, args.api_sps, args.cache)
+@dataclass
+class Inputs:
+    """Everything a report run needs, loaded once and shared by all report periods."""
+    reg: pd.DataFrame        # registration frame after assign_zones()
+    zones: pd.DataFrame      # zone_tlf_table()
+    tlm: pd.DataFrame        # zonal settled TLMs (may be empty)
+    etlmo: pd.DataFrame      # ETLMO table
+    reg_path: Path
+    tlm_path: Path
+    sps: list[int]
+    cache: Path
+
+
+def run_period(label: str, segments: Segments, inputs: Inputs, out_path: Path,
+               compare_with: Path | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build and write the workbook for one report period (a season or a custom range).
+
+    Returns:
+        (the per-BMU report, the zone summary), for use in the combined workbook.
+
+    Raises:
+        ValueError: if the period hasn't finished yet, or its ETLMO values are missing.
+    """
+    print(f"\n{label}: {describe(segments)}")
+    if segments[-1][1] >= date.today():
+        raise ValueError(f"period not finished until {segments[-1][1]}")
+    season_tlf, log = season_zone_tlf(segments, inputs.tlm, inputs.reg, inputs.etlmo,
+                                      inputs.sps, inputs.cache)
     for line in log:
         print(f"  {line}")
 
+    # Optional settled averages from tlm.csv.
+    tlm = inputs.tlm
     zone_stats = runs = None
     settled_msg = ("Not available: no tlm.csv" if tlm.empty else "Not available: tlm.csv covers "
                    f"{tlm['Settlement Date'].min()} to {tlm['Settlement Date'].max()}")
     try:
-        zone_stats, runs = zone_averages(tlm, segs)
+        zone_stats, runs = zone_averages(tlm, segments)
         settled_msg = check_consistency(zone_stats)
     except ValueError:
         print(f"  Settled averages: {settled_msg}")
 
-    report = build_report(reg, season_tlf, zones, zone_stats)
-    zone_summary = zones.merge(season_tlf, on="Zone", how="left")
+    report = build_report(inputs.reg, season_tlf, inputs.zones, zone_stats)
+    zone_summary = inputs.zones.merge(season_tlf, on="Zone", how="left")
     if zone_stats is not None:
         zone_summary = zone_summary.merge(zone_stats, on="Zone", how="left")
-        # settled average Off Taking should equal 1 + TLF + avg TLMO- for every zone
-        implied = (zone_summary["Avg Off Taking TLM"] - zone_summary["1 + TLF"])
-        print(f"  Cross-check: avg Off Taking - (1 + TLF) per zone ranges {implied.min():.7f}..{implied.max():.7f}")
+        # Settled Off Taking = 1 + TLF + TLMO-, so this difference should be equal across zones.
+        implied = zone_summary["Avg Off Taking TLM"] - zone_summary["1 + TLF"]
+        print(f"  Cross-check: avg Off Taking - (1 + TLF) per zone ranges "
+              f"{implied.min():.7f}..{implied.max():.7f}")
 
     sheets = {"TLMs": report, "Zone Summary": zone_summary}
     unmapped = report.loc[report["Zone"].isna(), "BM Unit ID"].tolist()
-    info = [
+    reg_date = datetime.fromtimestamp(inputs.reg_path.stat().st_mtime)
+    tlm_source = f"{inputs.tlm_path.name}; " if not tlm.empty else ""
+    info: list[tuple[str, object]] = [
         ("Report", f"{label} TLMs"),
-        ("Settlement dates", f"{describe(segs)} (inclusive)"),
+        ("Settlement dates", f"{describe(segments)} (inclusive)"),
         ("Seasons", "Elexon BSC seasons: Spring = Apr-May + following Mar, Summer = Jun-Aug, "
                     "Autumn = Sep-Nov, Winter = Dec-Feb. TLFs are set per season."),
         ("Generated", datetime.now().strftime("%Y-%m-%d %H:%M")),
-        ("TLM column", "1 + TLF for the BMU's zone in this season (same basis as 'Winter 2022 TLMs.xlsx'). "
-                       "Excludes the per-period loss adjustment TLMO±."),
-        ("Avg Settled TLM column", "Average settled TLM over the range from tlm.csv: Delivering for "
-                                   "production (P) BMUs, Off Taking for consumption (C) BMUs. Includes TLMO±."),
-        ("Season zone TLF source", "Elexon Insights API settlement stack TLMs (= 1 + TLF + ETLMO±) minus "
-                                   "published ETLMO; where tlm.csv covers the range its exact zone "
-                                   "differences are used and the API sets the level."),
+        ("TLM column", "1 + TLF for the BMU's zone in this season (same basis as the original "
+                       "'Winter 2022 TLMs.xlsx'). Excludes the per-period loss adjustment TLMO±."),
+        ("Avg Settled TLM column", "Average settled TLM over the range from tlm.csv: Delivering "
+                                   "for production (P) BMUs, Off Taking for consumption (C) BMUs. "
+                                   "Includes TLMO±."),
+        ("Season zone TLF source", "Elexon Insights API settlement stack TLMs (= 1 + TLF + ETLMO±) "
+                                   "minus published ETLMO; where tlm.csv covers the range its "
+                                   "exact zone differences are used and the API sets the level."),
         ("Season zone TLF bands", " | ".join(log)),
         ("Settled TLM check", settled_msg),
-        ("Zone assignment", "Registered TLF matched to current zone TLFs (zones 1-14 = GSP Groups _A.._P); "
-                            "GSP Group used if TLF does not match. Uses current registrations."),
+        ("Zone assignment", "Registered TLF matched to current zone TLFs (zones 1-14 = GSP Groups "
+                            "_A.._P); GSP Group used if TLF does not match. Uses current "
+                            "registrations."),
         ("BMUs", len(report)),
         ("BMUs without a zone", ", ".join(unmapped) or "none"),
-        ("Sources", f"{args.reg.name} (modified {datetime.fromtimestamp(args.reg.stat().st_mtime):%Y-%m-%d}); "
-                    f"{args.tlm.name}; {api.ETLMO_URL}; data.elexon.co.uk ISPSTACK"),
+        ("Sources", f"{inputs.reg_path.name} (modified {reg_date:%Y-%m-%d}); {tlm_source}"
+                    f"{api.ETLMO_URL}; data.elexon.co.uk ISPSTACK"),
     ]
 
-    if args.compare and compares(label, args):
-        cmp_df, summary = compare_reference(report, args.compare)
+    if compare_with is not None:
+        cmp_df, summary = compare_reference(report, compare_with)
         sheets["Reference Check"] = cmp_df
-        info.append(("Reference check", f"{args.compare.name}: {summary}"))
-        print(f"  Reference check vs {args.compare.name}: {summary}")
+        info.append(("Reference check", f"{compare_with.name}: {summary}"))
+        print(f"  Reference check vs {compare_with.name}: {summary}")
         diffs = cmp_df[cmp_df["Status"] == "Different"]
         if not diffs.empty:
             print(diffs.groupby("Zone")["Difference"].agg(["count", "min", "max"]).to_string())
 
-    out = args.out if args.out and len(args.ranges) == 1 else DEFAULT_OUT_DIR / f"{label} TLMs.xlsx"
-    write_excel(out, sheets, info, runs)
+    write_excel(out_path, sheets, info, runs)
     print(f"  {len(report)} BMUs; unmapped: {unmapped or 'none'}")
-    print(f"  Wrote {out}")
+    print(f"  Wrote {out_path}")
     return report, zone_summary
 
 
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+def write_combined_workbook(results: dict[str, tuple[pd.DataFrame, pd.DataFrame]],
+                            periods: list[tuple[str, Segments]], out_path: Path) -> None:
+    """Write one workbook with every period side by side (BMUs and zones by season)."""
+    wide = None
+    zone_rows = []
+    for label, (report, zone_summary) in results.items():
+        col = report[["BM Unit ID", "TLM"]].rename(columns={"TLM": label})
+        wide = col if wide is None else wide.merge(col, on="BM Unit ID", how="outer")
+        z = zone_summary[["Zone", "GSP Group Id", "GSP Group Name", "1 + TLF"]].copy()
+        z["Season"] = label
+        for c in ("Avg Delivering TLM", "Avg Off Taking TLM"):
+            z[c] = zone_summary[c] if c in zone_summary else float("nan")
+        zone_rows.append(z)
+
+    first_report = next(iter(results.values()))[0]
+    wide = first_report[["BM Unit ID", "BMU Type", "Zone", "Zone Name"]].merge(wide, on="BM Unit ID")
+    zone_long = pd.concat(zone_rows)
+    zone_wide = zone_long.pivot_table(index=["Zone", "GSP Group Id", "GSP Group Name"],
+                                      columns="Season", values="1 + TLF", sort=False).reset_index()
+    zone_wide.columns.name = None
+
+    info = [
+        ("Contents", "TLM = 1 + TLF for each BSC season (same basis as the original Winter 2022 "
+                     "report); one column per season. See the per-season workbooks for details."),
+        ("Seasons", "; ".join(f"{label} ({describe(segs)})" for label, segs in periods
+                              if label in results)),
+        ("Generated", datetime.now().strftime("%Y-%m-%d %H:%M")),
+    ]
+    write_excel(out_path, {"BMU TLMs by season": wide, "Zone TLMs by season": zone_wide,
+                           "Zone detail": zone_long}, info)
+    print(f"\nWrote {out_path}")
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line arguments (see the module docstring for examples)."""
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--season", action="append",
                    help='BSC season, e.g. "Winter 2022" (Dec 2022-Feb 2023). Repeatable.')
     p.add_argument("--bsc-year", type=int, action="append",
-                   help="all four seasons of BSC Year YYYY/YY+1 (Spring, Summer, Autumn, Winter). Repeatable.")
+                   help="all four seasons of BSC Year YYYY/YY+1. Repeatable.")
     p.add_argument("--start", type=date.fromisoformat, help="custom range start (YYYY-MM-DD)")
     p.add_argument("--end", type=date.fromisoformat, help="custom range end (YYYY-MM-DD)")
-    p.add_argument("--label", help="label for a custom range")
-    p.add_argument("--compare", type=Path, help="reference workbook (BM Unit ID, TLM) to check against")
-    p.add_argument("--tlm", type=Path, default=DEFAULT_TLM)
-    p.add_argument("--reg", type=Path, default=DEFAULT_REG)
-    p.add_argument("--out", type=Path, help="output .xlsx (single report only)")
-    p.add_argument("--cache", type=Path, default=DEFAULT_CACHE, help="download cache folder")
+    p.add_argument("--label", help="name for a custom range (used in the output file name)")
+    p.add_argument("--compare", type=Path,
+                   help="reference workbook (BM Unit ID, TLM) to check against; applied to the "
+                        "season named in its file name, or to every period if none is named")
+    p.add_argument("--reg", type=Path, default=DEFAULT_REG,
+                   help="Registered BM Units CSV (default: data/reg_bm_units.csv)")
+    p.add_argument("--tlm", type=Path, default=DEFAULT_TLM,
+                   help="zonal settled TLM CSV, optional (default: data/tlm.csv)")
+    p.add_argument("--out", type=Path, help="output .xlsx path (only when building one period)")
+    p.add_argument("--cache", type=Path, default=DEFAULT_CACHE,
+                   help="download cache folder (default: cache/)")
     p.add_argument("--api-sps", type=lambda s: [int(x) for x in s.split(",")], default=DEFAULT_SPS,
-                   help="settlement periods sampled per day from the API (default 2,10,18,26,34,42)")
-    p.add_argument("--refresh-etlmo", action="store_true", help="re-download the ETLMO table")
-    args = p.parse_args(argv)
+                   help="settlement periods sampled per day from the API (default: "
+                        + ",".join(map(str, DEFAULT_SPS)) + ")")
+    p.add_argument("--refresh-etlmo", action="store_true",
+                   help="re-download the ETLMO table (otherwise refreshed after 30 days)")
+    return p.parse_args(argv)
 
+
+def resolve_periods(args: argparse.Namespace, tlm: pd.DataFrame) -> list[tuple[str, Segments]]:
+    """Turn the period options into a date-ordered list of (label, segments).
+
+    Raises:
+        ValueError: for an invalid combination of options or a bad season name.
+    """
+    if args.start or args.end:
+        if not (args.start and args.end) or args.season or args.bsc_year:
+            raise ValueError("use --start and --end together, without --season/--bsc-year")
+        if args.start > args.end:
+            raise ValueError("--start must be on or before --end")
+        return [(args.label or f"{args.start} to {args.end}", [(args.start, args.end)])]
+
+    seasons = [s for y in (args.bsc_year or []) for s in bsc_year_seasons(y)] + (args.season or [])
+    if not seasons:
+        as_of = date.today() if tlm.empty else tlm["Settlement Date"].max()
+        seasons = [latest_complete_winter(as_of)]
+    periods = [(s.title(), season_segments(s)) for s in seasons]
+    return sorted(periods, key=lambda p: p[1][0][0])
+
+
+def should_compare(label: str, compare: Path, labels: list[str]) -> bool:
+    """Apply --compare to the period named in the reference file name (e.g. "Winter 2022
+    TLMs.xlsx"), or to every period if the file name doesn't name any of them."""
+    name = compare.name.lower()
+    return label.lower() in name or not any(other.lower() in name for other in labels)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Command-line entry point. Returns 0 on success and 2 if nothing could be built."""
+    args = parse_args(argv)
     tlm = load_tlm(args.tlm)
     reg = load_registration(args.reg)
     try:
         zones = zone_tlf_table(reg)
         etlmo = api.load_etlmo(args.cache, refresh=args.refresh_etlmo)
-        if args.start or args.end:
-            if not (args.start and args.end) or args.season or args.bsc_year:
-                raise ValueError("use --start and --end together, without --season/--bsc-year")
-            if args.start > args.end:
-                raise ValueError("--start must be on or before --end")
-            ranges = [(args.label or f"{args.start} to {args.end}", [(args.start, args.end)])]
-        else:
-            seasons = [s for y in (args.bsc_year or []) for s in bsc_year_seasons(y)] + (args.season or [])
-            seasons = seasons or [latest_complete_winter(
-                date.today() if tlm.empty else tlm["Settlement Date"].max())]
-            ranges = [(s.title(), season_segments(s)) for s in seasons]
-            ranges.sort(key=lambda r: r[1][0][0])
+        periods = resolve_periods(args, tlm)
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
-    reg = assign_zones(reg, zones)
-    args.ranges = ranges
-    results = {}
-    for label, segs in ranges:
+    inputs = Inputs(reg=assign_zones(reg, zones), zones=zones, tlm=tlm, etlmo=etlmo,
+                    reg_path=args.reg, tlm_path=args.tlm, sps=args.api_sps, cache=args.cache)
+    labels = [label for label, _ in periods]
+    results: dict[str, tuple[pd.DataFrame, pd.DataFrame]] = {}
+    for label, segments in periods:
+        out_path = args.out if args.out and len(periods) == 1 else DEFAULT_OUT_DIR / f"{label} TLMs.xlsx"
+        compare_with = (args.compare if args.compare and should_compare(label, args.compare, labels)
+                        else None)
         try:
-            results[label] = run_range(label, segs, tlm, reg, zones, etlmo, args)
+            results[label] = run_period(label, segments, inputs, out_path, compare_with)
         except ValueError as e:
             print(f"ERROR ({label}): {e} - skipped", file=sys.stderr)
     if not results:
         return 2
 
     if len(results) > 1:
-        wide = None
-        zone_rows = []
-        for label, (report, zs) in results.items():
-            col = report[["BM Unit ID", "TLM"]].rename(columns={"TLM": label})
-            wide = col if wide is None else wide.merge(col, on="BM Unit ID", how="outer")
-            z = zs[["Zone", "GSP Group Id", "GSP Group Name", "1 + TLF"]].copy()
-            z["Season"] = label
-            for c in ("Avg Delivering TLM", "Avg Off Taking TLM"):
-                z[c] = zs[c] if c in zs else float("nan")
-            zone_rows.append(z)
-        lead = results[next(iter(results))][0][["BM Unit ID", "BMU Type", "Zone", "Zone Name"]]
-        wide = lead.merge(wide, on="BM Unit ID")
-        zone_long = pd.concat(zone_rows)
-        zone_wide = zone_long.pivot_table(index=["Zone", "GSP Group Id", "GSP Group Name"],
-                                          columns="Season", values="1 + TLF", sort=False).reset_index()
-        zone_wide.columns.name = None
-        out = DEFAULT_OUT_DIR / "TLMs by season.xlsx"
-        write_excel(out, {"BMU TLMs by season": wide, "Zone TLMs by season": zone_wide,
-                          "Zone detail": zone_long},
-                    [("Contents", "TLM = 1 + TLF for each BSC season (same basis as the Winter 2022 file); "
-                                  "one column per season. See the per-season workbooks for details."),
-                     ("Seasons", "; ".join(f"{l} ({describe(segs)})" for l, segs in ranges
-                                           if l in results)),
-                     ("Generated", datetime.now().strftime("%Y-%m-%d %H:%M"))], None)
-        print(f"\nWrote {out}")
+        write_combined_workbook(results, periods, DEFAULT_OUT_DIR / "TLMs by season.xlsx")
     return 0
 
 

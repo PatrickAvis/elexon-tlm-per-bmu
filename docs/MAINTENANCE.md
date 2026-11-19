@@ -11,7 +11,7 @@ most likely to break, how to spot it and how to fix it.
   ever installed and the tests fail, install the tested versions instead:
   `pip install "pandas==2.3.3" "openpyxl==3.1.2"`. If those don't install on a newer Python, use
   Python 3.12.
-- **Always run `python -m pytest` first.** It runs offline in under a second.
+- **Always run `python -m pytest` first.** It runs offline in a few seconds.
 
 ## Refreshing inputs
 
@@ -52,7 +52,7 @@ latest, because it includes the following March.
 | Season definitions | `BSC_SEASONS` in `tlm_report.py` |
 | Zone ↔ GSP group mapping | `GSP_ZONE` in `tlm_report.py` |
 | Settlement periods sampled per day | `DEFAULT_SPS` in `tlm_report.py` |
-| API URLs | `ETLMO_URL`, `STACK_URL` in `elexon_api.py` |
+| API URLs, timeouts and retries | `ETLMO_URL`, `STACK_URL`, `HTTP_TIMEOUT_S`, `HTTP_RETRIES` in `elexon_api.py` |
 | Extra ETLMO values | `SUPPLEMENTARY_ETLMO` in `elexon_api.py` |
 | Cache | `cache/etlmo.csv`, `cache/ispstack/<date>_<period>_<bid|offer>.json`. Safe to delete; it's re-downloaded when needed. |
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-11-19: code tidy-up before going public
+- Full docstrings and comments throughout `tlm_report.py` and `elexon_api.py`; `main()` split
+  into `parse_args`, `resolve_periods`, `run_period` and `write_combined_workbook`.
+- Cache files are written atomically, so an interrupted run can't leave a partial file.
+- Vote ties are now broken deterministically (smallest value, labelled `Low`).
+- More offline tests (15). All generated outputs are unchanged.
+
 ## 2026-11-19: first version
 - Per-BMU TLM report for each Elexon BSC season: Spring (Apr–May + following Mar), Summer
   (Jun–Aug), Autumn (Sep–Nov), Winter (Dec–Feb).
